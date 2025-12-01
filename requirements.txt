@@ -1,0 +1,7 @@
+streamlit
+langchain-openai
+langchain-community
+langgraph
+biopython
+xmltodict
+certifi
