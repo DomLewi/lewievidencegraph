@@ -3,12 +3,19 @@ import os
 import json
 import re
 import time
+import ssl
+import certifi
 from typing import TypedDict, List, Dict, Any
 
-# --- PAGE CONFIG ---
+# --- 1. PAGE CONFIG ---
 st.set_page_config(page_title="EvidenceGraph Pro", page_icon="🧬", layout="wide")
 
-# --- CSS STYLING ---
+# --- 2. SECURE SSL CONFIGURATION ---
+# Instead of disabling security, we point Python to the valid Certificate Bundle.
+# This fixes the "Verification Failed" error while keeping the connection encrypted.
+os.environ['SSL_CERT_FILE'] = certifi.where()
+
+# --- 3. CSS STYLING ---
 st.markdown("""
 <style>
     .report-box { border: 1px solid #ddd; padding: 20px; border-radius: 10px; background-color: #f9f9f9; }
@@ -18,7 +25,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- DEPENDENCY CHECK ---
+# --- 4. DEPENDENCY CHECK ---
 with st.spinner("Initializing AI Core & Entrez..."):
     try:
         from Bio import Entrez, Medline
@@ -27,7 +34,7 @@ with st.spinner("Initializing AI Core & Entrez..."):
         from langgraph.graph import StateGraph, END
     except ImportError as e:
         st.error(f"❌ Missing Dependency: {e}")
-        st.info("Run this in terminal: `pip install langchain-openai langgraph biopython`")
+        st.info("Run this in terminal: `pip install langchain-openai langgraph biopython certifi`")
         st.stop()
 
 # --- SIDEBAR ---
@@ -37,7 +44,7 @@ with st.sidebar:
     user_api_key = st.text_input("OpenAI API Key", type="password", placeholder="sk-...")
     email_input = st.text_input("Email (Required for PubMed)", placeholder="your@email.com")
     
-    # P0 FIX: Validate Email immediately
+    # Validate Email immediately
     if email_input and not re.match(r"[^@]+@[^@]+\.[^@]+", email_input):
         st.error("Invalid email format. NCBI requires a valid email.")
     
@@ -100,7 +107,7 @@ def investigator_node(state):
         
     return {"search_queries": final_queries, "raw_docs": []}
 
-# --- NODE 2: HARVESTER (Fixed Parsing & Rate Limiting) ---
+# --- NODE 2: HARVESTER (With Fallback & Rate Limits) ---
 def harvester_node(state):
     config = state['config']
     placeholder = st.empty()
@@ -119,23 +126,30 @@ def harvester_node(state):
     total_q = len(state['search_queries'])
     
     for idx, query in enumerate(state['search_queries']):
+        time.sleep(0.35) # Rate Limit
         try:
-            # P0 FIX: Rate Limiting
-            time.sleep(0.35) 
-            
             # 1. Search
             handle = Entrez.esearch(db="pubmed", term=query, retmax=config['fetch_limit'])
             record = Entrez.read(handle)
             handle.close()
             id_list = record["IdList"]
             
+            # Fallback: Dumb Search
+            if not id_list:
+                simple_query = re.sub(r'\[.*?\]', '', query).replace('"', '').replace('(', '').replace(')', '')
+                # st.toast(f"Fallback Search: {simple_query[:20]}...", icon="🔄")
+                time.sleep(0.35)
+                handle = Entrez.esearch(db="pubmed", term=simple_query, retmax=config['fetch_limit'])
+                record = Entrez.read(handle)
+                handle.close()
+                id_list = record["IdList"]
+
             if not id_list:
                 continue
 
-            # P0 FIX: Rate Limiting before fetch
             time.sleep(0.35)
 
-            # 2. Fetch with Bio.Medline (P1 FIX: Robust Parsing)
+            # 2. Fetch
             handle = Entrez.efetch(db="pubmed", id=id_list, rettype="medline", retmode="text")
             records = Medline.parse(handle)
             
@@ -146,7 +160,6 @@ def harvester_node(state):
                 title = rec.get("TI", "Unknown Title")
                 abstract = rec.get("AB", "No Abstract Available.")
                 
-                # P1 FIX: Token Budgeting (Truncate Abstract)
                 if len(abstract) > 4000:
                     abstract = abstract[:4000] + "... [TRUNCATED]"
                 
@@ -161,7 +174,8 @@ def harvester_node(state):
             handle.close()
 
         except Exception as e:
-            pass # Keep moving on individual query failure
+            # st.warning(f"Entrez Error: {e}")
+            pass
         
         progress_bar.progress((idx + 1) / total_q)
             
@@ -172,12 +186,12 @@ def harvester_node(state):
         st.write(f"**[HARVESTER]:** Retrieved {len(all_docs)} unique records via Entrez.")
         
     if not all_docs:
-        st.error("Critical Failure: No documents retrieved. Try relaxing strict mode.")
+        st.error("Critical Failure: No documents retrieved. Check internet connection/firewall.")
         return {"raw_docs": [], "status": "FAIL"}
 
     return {"raw_docs": all_docs}
 
-# --- NODE 3: CURATOR (Visibility Fix) ---
+# --- NODE 3: CURATOR ---
 def curator_node(state):
     config = state['config']
     if not state['raw_docs']: return {"selected_docs": []}
@@ -185,17 +199,14 @@ def curator_node(state):
     with st.chat_message("assistant"):
         st.write("**[CURATOR]:** Scoring evidence against rubric...")
         
-    # P2 FIX: Dynamic Candidate Cap (Allow more context if model supports it)
-    # We increase cap to 50 for gpt-4o, but keeping a limit prevents OOM.
-    candidates = state['raw_docs'][:50]
-    
+    candidates = state['raw_docs'][:25]
     docs_text = "\n".join([f"ID:{d['uid']} | Title: {d['title']}" for d in candidates])
     
     prompt = [
         SystemMessage(content=f"""You are a Senior Editor. 
-        Evaluate these papers for relevance to: '{state['topic']}'.
+        Evaluate papers for relevance to: '{state['topic']}'.
         Assign a score (0-100).
-        Return a JSON list: [{{"uid": "123", "score": 90, "reason": "Reason"}}].
+        Return JSON list: [{{"uid": "123", "score": 90, "reason": "Reason"}}].
         Select Top {config['keep_best']}."""),
         HumanMessage(content=f"Candidates:\n{docs_text}")
     ]
@@ -215,13 +226,11 @@ def curator_node(state):
                     color = "green" if score > 80 else "orange" if score > 50 else "red"
                     st.markdown(f":{color}[**{score}/100**] {doc['title']}")
                     st.caption(f"Reason: {sel.get('reason', 'N/A')}")
-                    
                     doc['score'] = score
                     doc['reason'] = sel.get('reason')
                     selected_docs.append(doc)
     except Exception as e:
-        # P1 FIX: Explicit Warning on Fallback
-        st.warning(f"⚠️ Curator Logic Failed ({str(e)}). Falling back to simple ranking.")
+        st.warning(f"Curator Logic Failed ({str(e)}). Fallback to simple ranking.")
         selected_docs = candidates[:config['keep_best']]
         
     return {"selected_docs": selected_docs, "attempts": 0}
@@ -298,7 +307,7 @@ def build_graph():
 
 # --- MAIN UI LAYOUT ---
 st.title("🧬 EvidenceGraph Pro")
-st.caption("Bio.Entrez Edition | Medline Parsing | Compliance Hardened")
+st.caption("Bio.Entrez Edition | Deterministic Filtering | Scored Curation")
 
 topic_input = st.text_input("Enter Medical Topic:", placeholder="e.g., Creatine supplementation efficacy in Traumatic Brain Injury")
 
@@ -326,7 +335,7 @@ if st.button("🚀 Start Deep Research"):
         "config": config_data,
         "search_queries": [], "raw_docs": [], 
         "selected_docs": [], "synthesis_draft": "", "verified_report": {}, 
-        "critique": "", "attempts": 0
+        "critique": "", "attempts": 0, "logs": []
     }
     
     # Run the graph
