@@ -52,7 +52,7 @@ pip install -r requirements.txt
 
 Run the application:
 
-python -m streamlit run evidence_web_app.py
+python -m streamlit run evidencegraphwebapp.py
 
 
 🛡️ Disclaimer
